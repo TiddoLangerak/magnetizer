@@ -5,6 +5,13 @@ import fs from 'fs';
 import resolve from 'resolve';
 import { transformFile } from 'babel-core';
 import less from 'less';
+import minimist from 'minimist'
+
+const argv = minimist(process.argv.slice(2));
+//Source root is the absolute root folder from which files can be required.
+argv['source-root'] = argv['source-root'] || process.cwd();
+//Bundle root is the folder that will be used as the basedir for __dirname
+argv['bundle-root'] = argv['bundle-root'] || argv['source-root'];
 
 //TODO: in order to really speed things up we should do less in batches. I.e. currently we first
 //get all the deps, then resolve the deps, and then compile them. However, during waiting on
@@ -29,8 +36,9 @@ function promisify(f) {
 }
 
 const options = {
-	basePath : process.cwd() + '/src/main/webapp',
-	entries : process.argv.slice(2)
+	sourceRoot : argv['source-root'],
+	bundleRoot : argv['bundle-root'],
+	entries : argv._
 };
 
 
@@ -96,7 +104,7 @@ const compile = cachedFactory(async (file) => {
 	const ext = path.extname(file);
 	switch (ext) {
 		case '.js': {
-			const { code, map, ast } = await promisify(cb => transformFile(file, { sourceRoot : options.basePath }, cb));
+			const { code, map, ast } = await promisify(cb => transformFile(file, { sourceRoot : options.sourceRoot }, cb));
 			return { file, code, map };
 		}
 		case '.json': {
@@ -120,7 +128,7 @@ const compile = cachedFactory(async (file) => {
 
 async function build(file, out) {
 	console.log(`Building bundle for ${file}`);
-	const absEntryPath = path.resolve(options.basePath, file);
+	const absEntryPath = path.resolve(options.sourceRoot, file);
 	const files = await gatherFiles(absEntryPath);
 	console.log(`About to compile ${files.length} files`);
 	//NOTE: we need the arrow function here because otherwise we'll miss the cache
@@ -146,7 +154,7 @@ async function build(file, out) {
 			throw new Error("File compiled that has no id. That's not supposed to happen. File: ${file}");
 		}
 		const fileId = fileIds.get(file);
-		const dirname = path.relative(options.basePath, path.dirname(file));
+		const dirname = path.relative(options.bundleRoot, path.dirname(file));
 		return `${fileId} : [function(require, module, exports) {
 		  //TODO: don't automatically include this
 		  var __dirname = '${dirname}';

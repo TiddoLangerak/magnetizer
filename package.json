@@ -19,6 +19,7 @@
     "babel-core": "^6.3.26",
     "babel-polyfill": "^6.3.14",
     "less": "^2.5.3",
+    "minimist": "^1.2.0",
     "precinct": "^2.5.1",
     "resolve": "^1.1.6"
   }
