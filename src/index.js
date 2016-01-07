@@ -6,6 +6,9 @@ import resolve from 'resolve';
 import { transformFile } from 'babel-core';
 import less from 'less';
 import minimist from 'minimist'
+import combineSourceMap from 'combine-source-map';
+import convertSourceMap from 'convert-source-map';
+import vlq from 'vlq';
 
 const argv = minimist(process.argv.slice(2));
 //Source root is the absolute root folder from which files can be required.
@@ -98,13 +101,19 @@ async function gatherFiles(entry, seen = []) {
 }
 
 let compileCount = 0;
+let mapShown  = false;
 
 const compile = cachedFactory(async (file) => {
 	compileCount++;
 	const ext = path.extname(file);
 	switch (ext) {
 		case '.js': {
-			const { code, map, ast } = await promisify(cb => transformFile(file, { sourceRoot : options.sourceRoot }, cb));
+			const { code, map, ast } = await promisify(cb => transformFile(file, { sourceRoot : options.sourceRoot, sourceMaps : true }, cb));
+			if (!mapShown) {
+				//console.log(map);
+				mapShown = true;
+			}
+
 			return { file, code, map };
 		}
 		case '.json': {
@@ -137,9 +146,35 @@ async function build(file, out) {
 
 	const compiled = await Promise.all(files.map(file => compile(file)));
 
-	//TODO: move to somewhere else
 
-	const modules = await Promise.all(compiled.map(async ({ code, file }) => {
+	//Prefix
+	const offset = 5; //TODO: dynamically calculate this
+
+	const sourceMap = {
+		version: 3,
+		file: out,
+		sources : [],
+		names : [],
+		//TODO since I'm tired now. Source maps are pretty simple things: the mappings string is a list
+		//of line mappings, seperated by `;` (e.g. <mappingsLine1>;<mappingsLine2>;;<mappingsLine4>)
+		//The mappings themselves are tuples containing the offsets and the sources, encoded with vlq
+		//(https://github.com/Rich-Harris/vlq/tree/master/sourcemaps)
+		//If we have sourceMapA for file A and sourceMapB for file B and we want to create sourceMapAB
+		//then we can construct that one from sourceMapA by:
+		//- Add the sources and sourcesContent from sourceMapB to sourceMapA
+		//- Update the file indices in the mappings of sourceMapB such that they point to the correct source.
+		//  I.e. in sourceMapB the source of file B would be at index 0, but in sourceMapAB it will be at 1.
+		//  This needs to be updated in the mapping
+		//- Append the updated mapping to the mapping of SourceMapA
+		mappings : new Array(offset+1).join(';'),
+		sourcesContent : []
+	};
+	let sourceMapCol = 0;
+	let sourceMapRow = 0;
+	let sourcesIndex = 0;
+	//TODO: move to somewhere else
+	const modules = await compiled.reduce(async (resultPromise, { code, file, map }) => {
+		const result = await resultPromise;
 		const deps = await getDeps(file);
 		//This is the map of dependencies as `import`ed/`require`d -> fileId
 		const depMap = {};
@@ -155,22 +190,66 @@ async function build(file, out) {
 		}
 		const fileId = fileIds.get(file);
 		const dirname = path.relative(options.bundleRoot, path.dirname(file));
-		return `${fileId} : [function(require, module, exports) {
+
+		sourceMap.mappings += ';;;' //3 lines module prefix
+		if (map) {
+			const sourcesOffset = sourceMap.sources.length - sourcesIndex;
+			sourceMap.sources = [...sourceMap.sources, ...map.sources];
+			sourceMap.sourcesContent = [...sourceMap.sourcesContent, ...map.sourcesContent];
+			if (sourceMap.sources.length !== sourceMap.sourcesContent.length) {
+				throw new Error("Sources and sourcesContent have different lengths");
+			}
+			const vlqs = map.mappings.split(';').map(line => line.split(','));
+			let isFirst = true;
+			const mapped = vlqs.map(line => {
+				if (line.length === 0) {
+					return line;
+				}
+				return line.map(token => {
+					const parts = vlq.decode(token);
+					if (parts.length > 1) {
+						if (isFirst) {
+							parts[1] += sourcesOffset;
+							parts[2] -= sourceMapRow;
+							parts[3] -= sourceMapCol;
+							isFirst = false;
+						}
+						sourceMapRow += parts[2];
+						sourceMapCol += parts[3];
+					}
+					if (parts[4] !== undefined) {
+						throw new Error("We do not support names yet");
+					}
+					return vlq.encode(parts);
+				}).join(',');
+			}).join(';');
+			sourceMap.mappings += mapped;
+		} else {
+			const newLines = code.split('\n').length;
+			sourceMap.mappings += new Array(newLines + 1).join(';');
+		}
+		sourceMap.mappings += ';;'; //1 lines module postfix
+
+		return `${result}${fileId} : [function(require, module, exports) {
 		  //TODO: don't automatically include this
-		  var __dirname = '${dirname}';
-		  ${code}
-		}, ${depMapJson}]`;
-	}));
+		  var __dirname = '${dirname}';` + //The linebreak here is to ensure code start at column 0, which makes source maps easier
+		  `\n${code}
+		}, ${depMapJson}],
+		`;
+	}, Promise.resolve(''));
 
 	const entryId = fileIds.get(absEntryPath);
 
-	const bundle = `
-	(function() {
+	console.log(sourceMap);
+
+	const sourceMapComment = convertSourceMap.fromObject(sourceMap).toComment();
+
+	const bundle = `(function() {
 		//TODO: don't automatically include these
 		var global = window;
 		var DEV_MODE = true;
 
-		var modules = {${modules.join(',\n')}};
+		var modules = {${modules}};
 
 		var exports = {};
 
@@ -193,6 +272,7 @@ async function build(file, out) {
 		}
 		loadModule(${entryId});
 	}());
+	${sourceMapComment}
 	`;
 	await promisify(cb => fs.writeFile(out, bundle, 'utf8', cb));
 }
