@@ -9,13 +9,14 @@ import minimist from 'minimist'
 import combineSourceMap from 'combine-source-map';
 import convertSourceMap from 'convert-source-map';
 import vlq from 'vlq';
-import sourceMapConcatinator from './sourceMapConcatinator';
+import sourceMapConcatinator, { modes as sourceMapModes } from './sourceMapConcatinator';
 
 const argv = minimist(process.argv.slice(2));
 //Source root is the absolute root folder from which files can be required.
 argv['source-root'] = argv['source-root'] || process.cwd();
 //Bundle root is the folder that will be used as the basedir for __dirname
 argv['bundle-root'] = argv['bundle-root'] || argv['source-root'];
+const sourceMapMode = argv['source-map-compat'] ? sourceMapModes.COMPAT : sourceMapModes.FAST;
 
 //TODO: in order to really speed things up we should do less in batches. I.e. currently we first
 //get all the deps, then resolve the deps, and then compile them. However, during waiting on
@@ -109,7 +110,7 @@ const compile = cachedFactory(async (file) => {
 	const ext = path.extname(file);
 	switch (ext) {
 		case '.js': {
-			const { code, map, ast } = await promisify(cb => transformFile(file, { sourceRoot : options.sourceRoot, sourceMaps : true }, cb));
+			const { code, map, ast } = await promisify(cb => transformFile(file, { sourceRoot : options.sourceRoot, sourceMaps : true, sourceFileName: path.relative(options.sourceRoot, file), comments: false }, cb));
 			if (!mapShown) {
 				//console.log(map);
 				mapShown = true;
@@ -148,7 +149,7 @@ async function build(file, out) {
 	const compiled = await Promise.all(files.map(file => compile(file)));
 
 
-	const concatinator = sourceMapConcatinator(out);
+	const concatinator = sourceMapConcatinator(out, { mode : sourceMapMode });
 	concatinator.skipLines(6); //TODO: dynamically calculate this
 
 	//TODO: move to somewhere else
@@ -188,8 +189,7 @@ async function build(file, out) {
 
 	const entryId = fileIds.get(absEntryPath);
 
-//	console.log(JSON.stringify(sourceMap, null, 4));
-
+	fs.writeFileSync('/tmp/map', JSON.stringify(concatinator.getMap(), null, 4));
 	const sourceMapComment = convertSourceMap.fromObject(concatinator.getMap()).toComment();
 
 	const bundle = `(function() {
@@ -224,9 +224,7 @@ async function build(file, out) {
 			return cache[id].exports;
 		}
 		loadModule(${entryId});
-	}());
-	${sourceMapComment}
-	`;
+	}());\n${sourceMapComment}`;
 
 	await promisify(cb => fs.writeFile(out, bundle, 'utf8', cb));
 }
