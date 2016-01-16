@@ -9,6 +9,7 @@ import minimist from 'minimist'
 import combineSourceMap from 'combine-source-map';
 import convertSourceMap from 'convert-source-map';
 import vlq from 'vlq';
+import sourceMapConcatinator from './sourceMapConcatinator';
 
 const argv = minimist(process.argv.slice(2));
 //Source root is the absolute root folder from which files can be required.
@@ -147,31 +148,9 @@ async function build(file, out) {
 	const compiled = await Promise.all(files.map(file => compile(file)));
 
 
-	//Prefix
-	const offset = 5; //TODO: dynamically calculate this
+	const concatinator = sourceMapConcatinator(out);
+	concatinator.skipLines(6); //TODO: dynamically calculate this
 
-	const sourceMap = {
-		version: 3,
-		file: out,
-		sources : [],
-		names : [],
-		//TODO since I'm tired now. Source maps are pretty simple things: the mappings string is a list
-		//of line mappings, seperated by `;` (e.g. <mappingsLine1>;<mappingsLine2>;;<mappingsLine4>)
-		//The mappings themselves are tuples containing the offsets and the sources, encoded with vlq
-		//(https://github.com/Rich-Harris/vlq/tree/master/sourcemaps)
-		//If we have sourceMapA for file A and sourceMapB for file B and we want to create sourceMapAB
-		//then we can construct that one from sourceMapA by:
-		//- Add the sources and sourcesContent from sourceMapB to sourceMapA
-		//- Update the file indices in the mappings of sourceMapB such that they point to the correct source.
-		//  I.e. in sourceMapB the source of file B would be at index 0, but in sourceMapAB it will be at 1.
-		//  This needs to be updated in the mapping
-		//- Append the updated mapping to the mapping of SourceMapA
-		mappings : new Array(offset+1).join(';'),
-		sourcesContent : []
-	};
-	let sourceMapCol = 0;
-	let sourceMapRow = 0;
-	let sourcesIndex = 0;
 	//TODO: move to somewhere else
 	const modules = await compiled.reduce(async (resultPromise, { code, file, map }) => {
 		const result = await resultPromise;
@@ -191,67 +170,38 @@ async function build(file, out) {
 		const fileId = fileIds.get(file);
 		const dirname = path.relative(options.bundleRoot, path.dirname(file));
 
-		sourceMap.mappings += ';;;' //3 lines module prefix
-		if (map) {
-			const sourcesOffset = sourceMap.sources.length - sourcesIndex;
-			sourceMap.sources = [...sourceMap.sources, ...map.sources];
-			sourceMap.sourcesContent = [...sourceMap.sourcesContent, ...map.sourcesContent];
-			if (sourceMap.sources.length !== sourceMap.sourcesContent.length) {
-				throw new Error("Sources and sourcesContent have different lengths");
-			}
-			const vlqs = map.mappings.split(';').map(line => line.split(','));
-			let isFirst = true;
-			const mapped = vlqs.map(line => {
-				if (line.length === 0) {
-					return line;
-				}
-				return line.map(token => {
-					const parts = vlq.decode(token);
-					if (parts.length > 1) {
-						if (isFirst) {
-							parts[1] += sourcesOffset;
-							parts[2] -= sourceMapRow;
-							parts[3] -= sourceMapCol;
-							isFirst = false;
-						}
-						sourceMapRow += parts[2];
-						sourceMapCol += parts[3];
-					}
-					if (parts[4] !== undefined) {
-						throw new Error("We do not support names yet");
-					}
-					return vlq.encode(parts);
-				}).join(',');
-			}).join(';');
-			sourceMap.mappings += mapped;
-		} else {
-			const newLines = code.split('\n').length;
-			sourceMap.mappings += new Array(newLines + 1).join(';');
-		}
-		sourceMap.mappings += ';;'; //1 lines module postfix
-
-		return `${result}${fileId} : [function(require, module, exports) {
+		const modulePrefix = `${fileId} : [function(require, module, exports) {
 		  //TODO: don't automatically include this
-		  var __dirname = '${dirname}';` + //The linebreak here is to ensure code start at column 0, which makes source maps easier
-		  `\n${code}
+		  var __dirname = '${dirname}';\n`
+
+		const moduleSuffix = `
 		}, ${depMapJson}],
 		`;
+
+		//Prefix
+		concatinator.addSource(modulePrefix, null);
+		concatinator.addSource(code, map);
+		concatinator.addSource(moduleSuffix, null);
+
+		return `${result}${modulePrefix}${code}${moduleSuffix}`;
 	}, Promise.resolve(''));
 
 	const entryId = fileIds.get(absEntryPath);
 
-	console.log(sourceMap);
+//	console.log(JSON.stringify(sourceMap, null, 4));
 
-	const sourceMapComment = convertSourceMap.fromObject(sourceMap).toComment();
+	const sourceMapComment = convertSourceMap.fromObject(concatinator.getMap()).toComment();
 
 	const bundle = `(function() {
 		//TODO: don't automatically include these
 		var global = window;
 		var DEV_MODE = true;
 
-		var modules = {${modules}};
+		var modules = {
+			${modules}
+		};
 
-		var exports = {};
+		var cache = {};
 
 		function requireWith(mapping) {
 			return function(module) {
@@ -261,19 +211,23 @@ async function build(file, out) {
 		}
 
 		function loadModule(id) {
-			if (exports[id]) {
-				return exports[id];
+			if (cache[id]) {
+				return cache[id].exports;
 			}
 			var module = modules[id];
 			var moduleVar = { exports : {} };
-			module[0](requireWith(module[1]), moduleVar, moduleVar.exports);
-			exports[id] = moduleVar.exports;
-			return exports[id];
+			//We need to wrap the exports in an object such that we can properly deal with null/undefined
+			//Additionally we need to make sure to assign to exports[id] *before* calling the module,
+			//such that we can deal with circular dependencies
+			cache[id] = moduleVar;
+			module[0].call(moduleVar.exports, requireWith(module[1]), moduleVar, moduleVar.exports);
+			return cache[id].exports;
 		}
 		loadModule(${entryId});
 	}());
 	${sourceMapComment}
 	`;
+
 	await promisify(cb => fs.writeFile(out, bundle, 'utf8', cb));
 }
 
