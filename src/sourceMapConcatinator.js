@@ -16,6 +16,8 @@ function countCharOccurrence(string, search) {
 }
 
 const concatinators = {
+	//Fast mode makes use of the `sections` field in source maps. This enables very fast concatination,
+	//but unfortunatally it doesn't work properly in every browser.
 	[modes.FAST](file) {
 		const sourceMap = {
 			version : 3,
@@ -54,6 +56,8 @@ const concatinators = {
 
 		return concatinator;
 	},
+	//Compat mode actually merges source maps. This requires a lot more work, but does work in all
+	//browsers that support source maps
 	[modes.COMPAT](file) {
 		const sourceMap = {
 			version : 3,
@@ -64,6 +68,8 @@ const concatinators = {
 			mappings : ''
 		};
 
+		//All values in the sourcemaps are relative to the previous value, so we need to keep track
+		//of all values in order to adjust the values of newly added mappings
 		let sourcesIdx = 0;
 		let currentLine = 0;
 		let currentColumn = 0;
@@ -77,9 +83,14 @@ const concatinators = {
 			addSource(source, map = null) {
 				if (map) {
 					let firstMapping = true;
+
+					//Sometimes the nr of lines in the mapping doesn't correspond with the nr of lines in
+					//the source. In those cases we either need to cut of some lines from the mapping, or
+					//add a couple of lines to it.
 					const mappedLines = map.mappings.split(';');
 					const newLines = countCharOccurrence(source, '\n');
 					const nrOfMappedLines = mappedLines.length - 1;
+
 					let trailingLines = 0;
 					if ( nrOfMappedLines > newLines) {
 						console.warn(`Sourcemap for ${map.sources[0]} maps more lines then present in the file`);
@@ -96,7 +107,7 @@ const concatinators = {
 						return line.split(',').map(mapping => {
 							const vals = vlq.decode(mapping);
 							//Most values are relative to the previous value. The first value of each new
-							//source therefore must be adjusted for the previous sources
+							//source therefore must be adjusted for the previous sources.
 							if (firstMapping) {
 								if (vals.length > 1) {
 									//Relative index into the sources list.
@@ -130,6 +141,7 @@ const concatinators = {
 								firstMapping = false;
 							}
 
+							//And here we need to update our pointers
 							if (vals.length > 1) {
 								sourcesIdx += vals[1];
 							}

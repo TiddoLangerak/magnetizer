@@ -149,6 +149,8 @@ async function build(file, out) {
 	const compiled = await Promise.all(files.map(file => compile(file)));
 
 
+	const bundleStart = now();
+
 	const concatinator = sourceMapConcatinator(out, { mode : sourceMapMode });
 	concatinator.skipLines(6); //TODO: dynamically calculate this
 
@@ -189,7 +191,6 @@ async function build(file, out) {
 
 	const entryId = fileIds.get(absEntryPath);
 
-	fs.writeFileSync('/tmp/map', JSON.stringify(concatinator.getMap(), null, 4));
 	const sourceMapComment = convertSourceMap.fromObject(concatinator.getMap()).toComment();
 
 	const bundle = `(function() {
@@ -225,6 +226,11 @@ async function build(file, out) {
 		}
 		loadModule(${entryId});
 	}());\n${sourceMapComment}`;
+
+	const bundleEnd = now();
+
+	console.log(`Bundling took ${bundleEnd - bundleStart} ms`);
+
 
 	await promisify(cb => fs.writeFile(out, bundle, 'utf8', cb));
 }
