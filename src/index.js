@@ -3,7 +3,7 @@ import precinct from 'precinct';
 import path from 'path';
 import fs from 'fs';
 import resolve from 'resolve';
-import { transformFile } from 'babel-core';
+import { transform } from 'babel-core';
 import less from 'less';
 import minimist from 'minimist'
 import combineSourceMap from 'combine-source-map';
@@ -58,11 +58,7 @@ function cachedFactory(factory, keyFunc = x => x) {
 	}
 }
 
-function getFileContent(file) {
-	//TODO: CACHE ALL THE THINGS!!!
-	return promisify(cb => fs.readFile(file, 'utf8', cb));
-}
-
+const getFileContent = cachedFactory(async file => promisify(cb => fs.readFile(file, 'utf8', cb)));
 
 const getDeps = cachedFactory(async(file) => {
 	//We currently can't get dependencies other than .js files
@@ -103,18 +99,20 @@ async function gatherFiles(entry, seen = []) {
 }
 
 let compileCount = 0;
-let mapShown  = false;
 
 const compile = cachedFactory(async (file) => {
 	compileCount++;
 	const ext = path.extname(file);
 	switch (ext) {
 		case '.js': {
-			const { code, map, ast } = await promisify(cb => transformFile(file, { sourceRoot : options.sourceRoot, sourceMaps : true, sourceFileName: path.relative(options.sourceRoot, file), comments: false }, cb));
-			if (!mapShown) {
-				//console.log(map);
-				mapShown = true;
-			}
+			const source = await getFileContent(file);
+			const { code, map, ast } = transform(source, {
+				filename : file,
+				sourceRoot : options.sourceRoot,
+				sourceMaps : true,
+				sourceFileName: path.relative(options.sourceRoot, file),
+				comments: false
+			});
 
 			return { file, code, map };
 		}
