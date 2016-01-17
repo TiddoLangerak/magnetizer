@@ -178,20 +178,26 @@ async function build(file, out) {
 
 	async function run() {
 		console.log(`Building bundle for ${file}`);
+		const runStart = now();
 		const absEntryPath = path.resolve(options.sourceRoot, file);
 		const files = await gatherFiles(absEntryPath);
+		console.log(`Gathering files took ${now() - runStart}ms`);
 		await updateWatcher(files);
 		console.log(`About to compile ${files.length} files`);
 		//NOTE: we need the arrow function here because otherwise we'll miss the cache
 		const fileIds = new Map();
 		files.forEach((file, id) => fileIds.set(file, id));
 
+		const compileStart = now();
 		const compiled = await Promise.all(files.map(file => compile(file)));
-
+		const compileEnd = now();
+		console.log(`compiling took ${compileEnd - compileStart}ms`);
 
 		const bundleStart = now();
+		let sourceMapTime = 0;
 
 		const concatinator = sourceMapConcatinator(out, { mode : sourceMapMode });
+		sourceMapTime += (now() - bundleStart);
 		concatinator.skipLines(6); //TODO: dynamically calculate this
 
 		//TODO: move to somewhere else
@@ -222,16 +228,20 @@ async function build(file, out) {
 			`;
 
 			//Prefix
+			const beginMap = now();
 			concatinator.addSource(modulePrefix, null);
 			concatinator.addSource(code, map);
 			concatinator.addSource(moduleSuffix, null);
+			sourceMapTime += (now() - beginMap);
 
 			return `${result}${modulePrefix}${code}${moduleSuffix}`;
 		}, Promise.resolve(''));
 
 		const entryId = fileIds.get(absEntryPath);
 
+		const beginComment = now();
 		const sourceMapComment = convertSourceMap.fromObject(concatinator.getMap()).toComment();
+		sourceMapTime += (now() - beginComment);
 
 		const bundle = `(function() {
 			//TODO: don't automatically include these
@@ -269,7 +279,7 @@ async function build(file, out) {
 
 		const bundleEnd = now();
 
-		console.log(`Bundling took ${bundleEnd - bundleStart} ms`);
+		console.log(`Bundling took ${bundleEnd - bundleStart} ms, of which ${sourceMapTime} ms building source maps`);
 
 
 		await promisify(cb => fs.writeFile(out, bundle, 'utf8', cb));
