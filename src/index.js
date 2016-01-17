@@ -10,7 +10,8 @@ import combineSourceMap from 'combine-source-map';
 import convertSourceMap from 'convert-source-map';
 import vlq from 'vlq';
 import sourceMapConcatinator, { modes as sourceMapModes } from './sourceMapConcatinator';
-import { memoize, weakMemoize, promisify } from './util';
+import { memoize, promisify } from './util';
+import chokidar from 'chokidar';
 
 const argv = minimist(process.argv.slice(2));
 //Source root is the absolute root folder from which files can be required.
@@ -58,7 +59,7 @@ const getDeps = memoize(async(file) => {
 	}, {});
 });
 
-//TODO: also keep track of dependants, such that we can remove files that are no longer needed
+//TODO: also keep track of dependents, such that we can remove files that are no longer needed
 //Quick thought: maybe it's a better idea to keep an entire tree/graph of dependencies instead of just a list
 //
 
@@ -112,101 +113,168 @@ const compile = memoize(async (file) => {
 });
 
 async function build(file, out) {
-	console.log(`Building bundle for ${file}`);
-	const absEntryPath = path.resolve(options.sourceRoot, file);
-	const files = await gatherFiles(absEntryPath);
-	console.log(`About to compile ${files.length} files`);
-	//NOTE: we need the arrow function here because otherwise we'll miss the cache
-	const fileIds = new Map();
-	files.forEach((file, id) => fileIds.set(file, id));
 
-	const compiled = await Promise.all(files.map(file => compile(file)));
-
-
-	const bundleStart = now();
-
-	const concatinator = sourceMapConcatinator(out, { mode : sourceMapMode });
-	concatinator.skipLines(6); //TODO: dynamically calculate this
-
-	//TODO: move to somewhere else
-	const modules = await compiled.reduce(async (resultPromise, { code, file, map }) => {
-		const result = await resultPromise;
-		const deps = await getDeps(file);
-		//This is the map of dependencies as `import`ed/`require`d -> fileId
-		const depMap = {};
-		Object.entries(deps).forEach(([ relative, absolute ]) => {
-			if (!fileIds.has(absolute)) {
-				throw new Error("File imported that was not resolved. File: ${absolute}");
-			}
-			depMap[relative] = fileIds.get(absolute);
-		});
-		const depMapJson = JSON.stringify(depMap);
-		if (!fileIds.has(file)) {
-			throw new Error("File compiled that has no id. That's not supposed to happen. File: ${file}");
+	const updateWatcher = (function(){
+		if (!watch) {
+			console.log("no watchie");
+			return () => {};
 		}
-		const fileId = fileIds.get(file);
-		const dirname = path.relative(options.bundleRoot, path.dirname(file));
 
-		const modulePrefix = `${fileId} : [function(require, module, exports) {
-		  //TODO: don't automatically include this
-		  var __dirname = '${dirname}';\n`
+		let files = [];
+		console.log("Start watcher");
+		const watcher = chokidar.watch([], { persistent : true, ignoreInitial : true });
 
-		const moduleSuffix = `
-		}, ${depMapJson}],
-		`;
+		const dependents = new Map();
 
-		//Prefix
-		concatinator.addSource(modulePrefix, null);
-		concatinator.addSource(code, map);
-		concatinator.addSource(moduleSuffix, null);
+		async function updateDependents(file) {
+			const deps = await getDeps(file);
+			Object.values(deps).forEach(dep => {
+				if (!dependents.has(dep)) {
+					dependents.set(dep, new Set());
+				}
+				dependents.get(dep).add(file);
+			});
+		}
 
-		return `${result}${modulePrefix}${code}${moduleSuffix}`;
-	}, Promise.resolve(''));
+		async function watchHandler(file) {
+			//Not all events are triggered correctly. It often happens that a chang event gets triggered
+			//as an unlink event. We cannot assume that whatever chokidar tells us is right, so we just
+			//completely clean it up as if it is deleted. The run function will add it again anyway
+			//if needed
+			console.log(`${file} changed/removed. Recompiling`);
+			const start = now();
+			getFileContent.forget(file);
+			getDeps.forget(file);
+			compile.forget(file);
+			const fileDependents = dependents.get(file) || [];
+			fileDependents.forEach(getDeps.forget);
+			dependents.delete(file);
+			files = files.filter(f => file !== f);
+			try {
+				await run();
+			} catch (e) {
+				console.error("Compilation failed:");
+				console.error(e);
+			}
+			console.log(`Incremental compile took ${now() - start}ms`);
+		}
 
-	const entryId = fileIds.get(absEntryPath);
+		watcher.on('unlink', watchHandler);
+		watcher.on('change', watchHandler);
 
-	const sourceMapComment = convertSourceMap.fromObject(concatinator.getMap()).toComment();
+		return async (newFiles) => {
+			const removed = files.filter(file => !newFiles.includes(file));
+			const added = newFiles.filter(file => !files.includes(file));
+			files = newFiles;
 
-	const bundle = `(function() {
-		//TODO: don't automatically include these
-		var global = window;
-		var DEV_MODE = true;
 
-		var modules = {
-			${modules}
+			watcher.unwatch(removed);
+			watcher.add(added);
+			await Promise.all(added.map(updateDependents));
+
 		};
 
-		var cache = {};
+	}());
 
-		function requireWith(mapping) {
-			return function(module) {
-			  var id = mapping[module];
-				return loadModule(id);
+	async function run() {
+		console.log(`Building bundle for ${file}`);
+		const absEntryPath = path.resolve(options.sourceRoot, file);
+		const files = await gatherFiles(absEntryPath);
+		await updateWatcher(files);
+		console.log(`About to compile ${files.length} files`);
+		//NOTE: we need the arrow function here because otherwise we'll miss the cache
+		const fileIds = new Map();
+		files.forEach((file, id) => fileIds.set(file, id));
+
+		const compiled = await Promise.all(files.map(file => compile(file)));
+
+
+		const bundleStart = now();
+
+		const concatinator = sourceMapConcatinator(out, { mode : sourceMapMode });
+		concatinator.skipLines(6); //TODO: dynamically calculate this
+
+		//TODO: move to somewhere else
+		const modules = await compiled.reduce(async (resultPromise, { code, file, map }) => {
+			const result = await resultPromise;
+			const deps = await getDeps(file);
+			//This is the map of dependencies as `import`ed/`require`d -> fileId
+			const depMap = {};
+			Object.entries(deps).forEach(([ relative, absolute ]) => {
+				if (!fileIds.has(absolute)) {
+					throw new Error("File imported that was not resolved. File: ${absolute}");
+				}
+				depMap[relative] = fileIds.get(absolute);
+			});
+			const depMapJson = JSON.stringify(depMap);
+			if (!fileIds.has(file)) {
+				throw new Error("File compiled that has no id. That's not supposed to happen. File: ${file}");
 			}
-		}
+			const fileId = fileIds.get(file);
+			const dirname = path.relative(options.bundleRoot, path.dirname(file));
 
-		function loadModule(id) {
-			if (cache[id]) {
+			const modulePrefix = `${fileId} : [function(require, module, exports) {
+				//TODO: don't automatically include this
+				var __dirname = '${dirname}';\n`
+
+			const moduleSuffix = `
+			}, ${depMapJson}],
+			`;
+
+			//Prefix
+			concatinator.addSource(modulePrefix, null);
+			concatinator.addSource(code, map);
+			concatinator.addSource(moduleSuffix, null);
+
+			return `${result}${modulePrefix}${code}${moduleSuffix}`;
+		}, Promise.resolve(''));
+
+		const entryId = fileIds.get(absEntryPath);
+
+		const sourceMapComment = convertSourceMap.fromObject(concatinator.getMap()).toComment();
+
+		const bundle = `(function() {
+			//TODO: don't automatically include these
+			var global = window;
+			var DEV_MODE = true;
+
+			var modules = {
+				${modules}
+			};
+
+			var cache = {};
+
+			function requireWith(mapping) {
+				return function(module) {
+					var id = mapping[module];
+					return loadModule(id);
+				}
+			}
+
+			function loadModule(id) {
+				if (cache[id]) {
+					return cache[id].exports;
+				}
+				var module = modules[id];
+				var moduleVar = { exports : {} };
+				//We need to wrap the exports in an object such that we can properly deal with null/undefined
+				//Additionally we need to make sure to assign to exports[id] *before* calling the module,
+				//such that we can deal with circular dependencies
+				cache[id] = moduleVar;
+				module[0].call(moduleVar.exports, requireWith(module[1]), moduleVar, moduleVar.exports);
 				return cache[id].exports;
 			}
-			var module = modules[id];
-			var moduleVar = { exports : {} };
-			//We need to wrap the exports in an object such that we can properly deal with null/undefined
-			//Additionally we need to make sure to assign to exports[id] *before* calling the module,
-			//such that we can deal with circular dependencies
-			cache[id] = moduleVar;
-			module[0].call(moduleVar.exports, requireWith(module[1]), moduleVar, moduleVar.exports);
-			return cache[id].exports;
-		}
-		loadModule(${entryId});
-	}());\n${sourceMapComment}`;
+			loadModule(${entryId});
+		}());\n${sourceMapComment}`;
 
-	const bundleEnd = now();
+		const bundleEnd = now();
 
-	console.log(`Bundling took ${bundleEnd - bundleStart} ms`);
+		console.log(`Bundling took ${bundleEnd - bundleStart} ms`);
 
 
-	await promisify(cb => fs.writeFile(out, bundle, 'utf8', cb));
+		await promisify(cb => fs.writeFile(out, bundle, 'utf8', cb));
+	}
+	return await run();
 }
 
 Promise.all(options.entries.map(entry => build(entry, 'out/' + path.basename(entry)))) //TODO: make output configurable

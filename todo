@@ -1,0 +1,4 @@
+- Make sure only one compilation runs at the same time
+- Check what happens during branch switching
+- Fix less (both that it works and that watchers are set correctly)
+- Cache source map meuk

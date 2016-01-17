@@ -1,4 +1,5 @@
-export function memoize(factory, keyFunc = x => x, cache = new Map()) {
+export function memoize(factory, keyFunc = x => x) {
+	const cache = new Map();
 	const func = (...params) => {
 		const key = keyFunc(...params);
 		if (!cache.has(key)) {
@@ -10,10 +11,6 @@ export function memoize(factory, keyFunc = x => x, cache = new Map()) {
 		cache.delete(keyFunc(...params));
 	}
 	return func;
-}
-
-export function weakMemoize(factory, keyFunc = x => x) {
-	return memoize(factory, keyFunc, new WeakMap());
 }
 
 export function promisify(f) {
