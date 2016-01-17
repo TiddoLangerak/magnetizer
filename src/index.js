@@ -10,6 +10,7 @@ import combineSourceMap from 'combine-source-map';
 import convertSourceMap from 'convert-source-map';
 import vlq from 'vlq';
 import sourceMapConcatinator, { modes as sourceMapModes } from './sourceMapConcatinator';
+import { memoize, weakMemoize, promisify } from './util';
 
 const argv = minimist(process.argv.slice(2));
 //Source root is the absolute root folder from which files can be required.
@@ -17,28 +18,17 @@ argv['source-root'] = argv['source-root'] || process.cwd();
 //Bundle root is the folder that will be used as the basedir for __dirname
 argv['bundle-root'] = argv['bundle-root'] || argv['source-root'];
 const sourceMapMode = argv['source-map-compat'] ? sourceMapModes.COMPAT : sourceMapModes.FAST;
+const watch = argv['watch'] || argv['w'];
 
 //TODO: in order to really speed things up we should do less in batches. I.e. currently we first
 //get all the deps, then resolve the deps, and then compile them. However, during waiting on
 //the files to load we can perfectly fine already compile some others
 
 function now() {
-	return new Date().getTime();
+	return Date.now();
 }
 
 const start = now();
-
-function promisify(f) {
-	return new Promise((resolve, reject) => {
-		f((err, res) => {
-			if (err) {
-				reject(err);
-			} else {
-				resolve(res);
-			}
-		});
-	});
-}
 
 const options = {
 	sourceRoot : argv['source-root'],
@@ -47,20 +37,10 @@ const options = {
 };
 
 
-function cachedFactory(factory, keyFunc = x => x) {
-	const cache = new Map();
-	return (...params) => {
-		const key = keyFunc(...params);
-		if (!cache.has(key)) {
-			cache.set(key, factory(...params));
-		}
-		return cache.get(key);
-	}
-}
+const getFileContent = memoize(async file => promisify(cb => fs.readFile(file, 'utf8', cb)));
 
-const getFileContent = cachedFactory(async file => promisify(cb => fs.readFile(file, 'utf8', cb)));
-
-const getDeps = cachedFactory(async(file) => {
+//Get the dependencies of a single file
+const getDeps = memoize(async(file) => {
 	//We currently can't get dependencies other than .js files
 	if (path.extname(file) !== '.js') {
 		return [];
@@ -72,13 +52,10 @@ const getDeps = cachedFactory(async(file) => {
 			.map(dep => promisify(cb => resolve(dep, { basedir: path.dirname(file) }, cb)))
 	);
 
-
-	return relativeDeps.map((relative, idx) => {
-		return {
-			relative,
-			absolute : absoluteDeps[idx]
-		}
-	});
+	return relativeDeps.reduce((depMap, dep, idx) => {
+		depMap[dep] = absoluteDeps[idx];
+		return depMap;
+	}, {});
 });
 
 //TODO: also keep track of dependants, such that we can remove files that are no longer needed
@@ -92,15 +69,15 @@ async function gatherFiles(entry, seen = []) {
 	}
 	seen.push(entry);
 	const deps = (await getDeps(entry));
-	await Promise.all(deps
-		.map(dep => gatherFiles(dep.absolute, seen))
+	await Promise.all(Object.values(deps)
+		.map(dep => gatherFiles(dep, seen))
 	);
 	return seen;
 }
 
 let compileCount = 0;
 
-const compile = cachedFactory(async (file) => {
+const compile = memoize(async (file) => {
 	compileCount++;
 	const ext = path.extname(file);
 	switch (ext) {
@@ -134,7 +111,6 @@ const compile = cachedFactory(async (file) => {
 	}
 });
 
-
 async function build(file, out) {
 	console.log(`Building bundle for ${file}`);
 	const absEntryPath = path.resolve(options.sourceRoot, file);
@@ -158,7 +134,7 @@ async function build(file, out) {
 		const deps = await getDeps(file);
 		//This is the map of dependencies as `import`ed/`require`d -> fileId
 		const depMap = {};
-		deps.forEach(({ absolute, relative }) => {
+		Object.entries(deps).forEach(([ relative, absolute ]) => {
 			if (!fileIds.has(absolute)) {
 				throw new Error("File imported that was not resolved. File: ${absolute}");
 			}
