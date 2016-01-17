@@ -200,9 +200,12 @@ async function build(file, out) {
 		sourceMapTime += (now() - bundleStart);
 		concatinator.skipLines(6); //TODO: dynamically calculate this
 
+		let concatTime = 0;
+
 		//TODO: move to somewhere else
 		const modules = await compiled.reduce(async (resultPromise, { code, file, map }) => {
 			const result = await resultPromise;
+			const start = now();
 			const deps = await getDeps(file);
 			//This is the map of dependencies as `import`ed/`require`d -> fileId
 			const depMap = {};
@@ -234,14 +237,21 @@ async function build(file, out) {
 			concatinator.addSource(moduleSuffix, null);
 			sourceMapTime += (now() - beginMap);
 
-			return `${result}${modulePrefix}${code}${moduleSuffix}`;
+			const res = `${result}${modulePrefix}${code}${moduleSuffix}`;
+			const end = now();
+			concatTime += (end - start);
+
+			return res;
 		}, Promise.resolve(''));
+		concatTime -= sourceMapTime;
 
 		const entryId = fileIds.get(absEntryPath);
 
 		const beginComment = now();
 		const sourceMapComment = convertSourceMap.fromObject(concatinator.getMap()).toComment();
-		sourceMapTime += (now() - beginComment);
+		//const sourceMapComment = '';
+		const endComment = now();
+		sourceMapTime += (endComment - beginComment);
 
 		const bundle = `(function() {
 			//TODO: don't automatically include these
@@ -279,7 +289,7 @@ async function build(file, out) {
 
 		const bundleEnd = now();
 
-		console.log(`Bundling took ${bundleEnd - bundleStart} ms, of which ${sourceMapTime} ms building source maps`);
+		console.log(`Bundling took ${bundleEnd - bundleStart} ms, of which ${sourceMapTime} ms building source maps  ${concatTime}ms building modules and ${bundleEnd - endComment}ms building the bundle string`);
 
 
 		await promisify(cb => fs.writeFile(out, bundle, 'utf8', cb));

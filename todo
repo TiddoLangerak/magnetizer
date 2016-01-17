@@ -2,3 +2,8 @@
 - Check what happens during branch switching
 - Fix less (both that it works and that watchers are set correctly)
 - Cache source map meuk
+
+- Optimize incremental build.
+	Currently the slowest parts are:
+	* GatherFiles. This is likely due to `resolve` being slow. We can likely optimize this by doing some caching.
+	* compat source maps. We can likely optimize this by caching & parallalization
